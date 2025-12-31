@@ -16,7 +16,7 @@ interface IERC20Minimal {
 /// @notice Lightweight multicall-style executor that pulls funds from the caller, forwards
 /// them through arbitrary calls (e.g. DEX routers), and flushes specified tokens back to the caller.
 /// @dev SECURITY: Stateless design - funds are returned to msg.sender after each execution.
-contract AequiExecutor {
+contract LuxExecutor {
     /// @dev Simple non-reentrancy guard.
     uint256 private constant _UNLOCKED = 1;
     uint256 private constant _LOCKED = 2;

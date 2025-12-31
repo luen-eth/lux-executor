@@ -1,7 +1,7 @@
 const hre = require("hardhat");
 
 async function main() {
-    console.log("🚀 LuxExecutor (AequiExecutor) Deployment Script");
+    console.log("🚀 LuxExecutor (LuxExecutor) Deployment Script");
     console.log("=".repeat(50));
     console.log(`Network: ${hre.network.name}`);
     console.log(`Chain ID: ${(await hre.ethers.provider.getNetwork()).chainId}`);
@@ -30,16 +30,16 @@ async function main() {
     console.log("4. Biswap Router:", initialTargets[3]);
     console.log("-".repeat(50));
 
-    console.log("\n⏳ Deploying AequiExecutor contract...\n");
+    console.log("\n⏳ Deploying LuxExecutor contract...\n");
 
     // Deploy the contract
-    const AequiExecutor = await hre.ethers.getContractFactory("AequiExecutor");
-    const executor = await AequiExecutor.deploy(initialTargets);
+    const LuxExecutor = await hre.ethers.getContractFactory("LuxExecutor");
+    const executor = await LuxExecutor.deploy(initialTargets);
 
     await executor.waitForDeployment();
     const contractAddress = await executor.getAddress();
 
-    console.log("✅ AequiExecutor deployed successfully!");
+    console.log("✅ LuxExecutor deployed successfully!");
     console.log("=".repeat(50));
     console.log(`📍 Contract Address: ${contractAddress}`);
     console.log(`👤 Owner: ${await executor.owner()}`);

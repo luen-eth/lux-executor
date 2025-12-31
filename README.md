@@ -16,7 +16,7 @@ Multicall-style DEX Executor smart contract. Pulls funds from users, executes sw
 
 ## 🎯 What Does It Do?
 
-**AequiExecutor** is a **multicall executor** contract that enables users to perform multiple DEX swap operations in a single transaction.
+**LuxExecutor** is a **multicall executor** contract that enables users to perform multiple DEX swap operations in a single transaction.
 
 ### Workflow:
 ```
@@ -227,7 +227,7 @@ function execute(
 ### Example Call (JavaScript)
 
 ```javascript
-const executor = await ethers.getContractAt("AequiExecutor", EXECUTOR_ADDRESS);
+const executor = await ethers.getContractAt("LuxExecutor", EXECUTOR_ADDRESS);
 
 // Token A -> Token B swap
 const tx = await executor.execute(
