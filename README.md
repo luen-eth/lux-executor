@@ -1,4 +1,4 @@
-# 🚀 LuxExecutor 
+# LuxExecutor 
 
 Multicall-style DEX Executor smart contract. Pulls funds from users, executes swap operations through DEX routers, and returns output tokens back to the caller.
 
