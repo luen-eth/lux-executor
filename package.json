@@ -1,0 +1,27 @@
+{
+    "name": "lux-executor",
+    "version": "1.0.0",
+    "description": "LuxExecutor - Multicall DEX Executor Smart Contract",
+    "scripts": {
+        "compile": "hardhat compile",
+        "test": "hardhat test",
+        "deploy:bsc": "hardhat run scripts/deploy.js --network bsc",
+        "deploy:bsc-testnet": "hardhat run scripts/deploy.js --network bscTestnet",
+        "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+        "verify": "hardhat verify"
+    },
+    "devDependencies": {
+        "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+        "hardhat": "^2.19.0",
+        "dotenv": "^16.3.1"
+    },
+    "keywords": [
+        "solidity",
+        "dex",
+        "multicall",
+        "executor",
+        "bsc"
+    ],
+    "author": "",
+    "license": "MIT"
+}
