@@ -127,6 +127,7 @@ contract LuxExecutor {
         selectorOffsets[0xc04b8d59] = 100;
         // V3: exactInputSingle (SwapRouter02, no deadline) -> amountIn at offset 132
         selectorOffsets[0x414bf389] = 164;
+        selectorOffsets[0x2e1a7d4d] = 4;
     }
 
     receive() external payable {}
