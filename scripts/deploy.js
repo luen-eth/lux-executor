@@ -15,12 +15,7 @@ async function main() {
 
     // Constructor Parameters - BSC DEX Router Addresses
     // These are the initial whitelisted targets
-    const initialTargets = [
-        "0x10ED43C718714eb63d5aA57B78B54704E256024E", // PancakeSwap V2 Router
-        "0x1b81D678ffb9C0263b24A97847620C99d213eB14", // PancakeSwap V3 SwapRouter
-        "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24", // Uniswap V3 Router (BSC)
-        "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2", // Biswap Router
-    ];
+    const initialTargets = ["0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", "0x10ED43C718714eb63d5aA57B78B54704E256024E", "0x1b81D678ffb9C0263b24A97847620C99d213eB14", "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24", "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2"];
 
     console.log("\n📋 Initial Whitelisted DEX Routers:");
     console.log("-".repeat(50));
