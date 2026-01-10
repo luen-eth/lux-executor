@@ -1,55 +1,26 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
-// const ["0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c","0x10ED43C718714eb63d5aA57B78B54704E256024E","0x1b81D678ffb9C0263b24A97847620C99d213eB14","0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24","0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2"]
-/// @notice Minimal ERC-20 interface subset used by the executor.
-interface IERC20Minimal {
-    function transferFrom(
-        address from,
-        address to,
-        uint256 amount
-    ) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
 
-/// @notice Lightweight multicall-style executor that pulls funds from the caller, forwards
-/// them through arbitrary calls (e.g. DEX routers), and flushes specified tokens back to the caller.
-/// @dev SECURITY: Stateless design - funds are returned to msg.sender after each execution.
-contract LuxExecutor {
-    /// @dev Simple non-reentrancy guard.
-    uint256 private constant _UNLOCKED = 1;
-    uint256 private constant _LOCKED = 2;
-    uint256 private _status = _UNLOCKED;
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
 
-    /// @dev Array length limits to prevent DoS
-    uint256 private constant MAX_PULLS = 10;
-    uint256 private constant MAX_APPROVALS = 20;
-    uint256 private constant MAX_CALLS = 10;
-    uint256 private constant MAX_FLUSH_TOKENS = 20;
-    uint256 private constant MAX_BATCH_WHITELIST = 50;
+contract LuxExecutor is Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    using Address for address;
 
-    /// @dev Dynamic selector whitelist: selector => expected amountIn offset (0 = not whitelisted)
-    mapping(bytes4 => uint256) public selectorOffsets;
-
-    error ReentrancyGuard();
-    error TokenPullFailed(address token, uint256 amount);
-    error TokenFlushFailed(address token);
-    error TokenApprovalFailed(address token, address spender, uint256 amount);
-    error NativeTransferFailed(address recipient, uint256 amount);
-    error ZeroAmountNotAllowed();
-    error InvalidInjectionOffset(uint256 offset, uint256 dataLength);
-    error ArrayLengthExceeded(string arrayName, uint256 length, uint256 max);
-    error SpenderNotWhitelisted(address spender);
-    error DuplicateTokenInFlush(address token);
-    error InvalidSelectorForInjection(bytes4 selector);
-    error OffsetMismatchForSelector(
-        bytes4 selector,
-        uint256 providedOffset,
-        uint256 expectedOffset
-    );
+    error ExecutionFailed(uint256 index, address target, bytes reason);
+    error InvalidInjectionOffset(uint256 offset, uint256 length);
+    error ZeroAmountInjection();
     error TargetNotWhitelisted(address target);
-    error InvalidOffset(uint256 offset);
+
+    // Router whitelist for security - only approved targets can be called
+    mapping(address => bool) public whitelistedTargets;
+
+    event TargetWhitelisted(address indexed target, bool status);
 
     struct TokenPull {
         address token;
@@ -60,514 +31,225 @@ contract LuxExecutor {
         address token;
         address spender;
         uint256 amount;
-        bool revokeAfter;
     }
+    // Note: revokeAfter removed - always revoke for security
 
     struct Call {
         address target;
         uint256 value;
         bytes data;
-        address injectToken;
-        uint256 injectOffset;
+        address injectToken; // If non-zero, injects the balance of this token into the call data
+        uint256 injectOffset; // The byte offset in 'data' to overwrite with the balance
     }
 
-    /// @notice Contract owner for emergency functions
-    address public owner;
-
-    /// @notice Whitelisted targets that are allowed to be called
-    mapping(address => bool) public whitelistedTargets;
-
-    event OwnershipTransferred(
-        address indexed previousOwner,
-        address indexed newOwner
-    );
-    event EmergencyWithdrawETH(address indexed to, uint256 amount);
-    event EmergencyWithdrawToken(
-        address indexed token,
-        address indexed to,
-        uint256 amount
-    );
-    event TargetWhitelisted(address indexed target, bool status);
-    event SelectorWhitelisted(bytes4 indexed selector, uint256 offset);
-    event Executed(
-        address indexed user,
-        uint256 pullCount,
-        uint256 callCount,
-        uint256 ethReturned
-    );
-
-    modifier nonReentrant() {
-        if (_status != _UNLOCKED) revert ReentrancyGuard();
-        _status = _LOCKED;
-        _;
-        _status = _UNLOCKED;
-    }
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "NOT_OWNER");
-        _;
-    }
-
-    constructor(address[] memory initialTargets) {
-        owner = msg.sender;
-
-        // Whitelist initial DEX routers (passed as parameter for chain flexibility)
-        for (uint256 i = 0; i < initialTargets.length; i++) {
-            if (initialTargets[i] != address(0)) {
-                whitelistedTargets[initialTargets[i]] = true;
-            }
-        }
-
-        // Initialize default selector offsets
-        // V2: swapExactTokensForTokens -> amountIn at offset 4
-        selectorOffsets[0x38ed1739] = 4;
-        // V3: exactInputSingle (with deadline) -> amountIn at offset 164
-        selectorOffsets[0x04e45aaf] = 132;
-        // V3: exactInput (multi-hop) -> amountIn at offset 100
-        selectorOffsets[0xc04b8d59] = 100;
-        // V3: exactInputSingle (SwapRouter02, no deadline) -> amountIn at offset 132
-        selectorOffsets[0x414bf389] = 164;
-        selectorOffsets[0x2e1a7d4d] = 4;
+    constructor(address initialOwner) Ownable(initialOwner) {
+        // BSC DEX Routers - automatically whitelisted
+        whitelistedTargets[0x10ED43C718714eb63d5aA57B78B54704E256024E] = true; // PancakeSwap V2 Router
+        whitelistedTargets[0x1b81D678ffb9C0263b24A97847620C99d213eB14] = true; // PancakeSwap V3 Router
+        whitelistedTargets[0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24] = true; // Uniswap V2 Router (BSC)
+        whitelistedTargets[0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2] = true; // Uniswap V3 Router (BSC)
+        whitelistedTargets[0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c] = true; // WBNB (for wrap/unwrap)
     }
 
     receive() external payable {}
 
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "INVALID_OWNER");
-        address oldOwner = owner;
-        owner = newOwner;
-        emit OwnershipTransferred(oldOwner, newOwner);
+    function pause() external onlyOwner {
+        _pause();
     }
 
-    function emergencyWithdrawETH(address payable to) external onlyOwner {
-        require(to != address(0), "INVALID_RECIPIENT");
-        uint256 balance = address(this).balance;
-        require(balance > 0, "NO_ETH_BALANCE");
-        (bool success, ) = to.call{value: balance}("");
-        require(success, "ETH_TRANSFER_FAILED");
-        emit EmergencyWithdrawETH(to, balance);
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
-    function emergencyWithdrawToken(
+    function rescueFunds(
         address token,
-        address to
+        address to,
+        uint256 amount
     ) external onlyOwner {
-        require(to != address(0), "INVALID_RECIPIENT");
-        uint256 balance = IERC20Minimal(token).balanceOf(address(this));
-        require(balance > 0, "NO_TOKEN_BALANCE");
-        (bool success, bytes memory returnData) = token.call(
-            abi.encodeWithSelector(IERC20Minimal.transfer.selector, to, balance)
-        );
-        require(
-            success &&
-                (returnData.length == 0 || abi.decode(returnData, (bool))),
-            "TOKEN_TRANSFER_FAILED"
-        );
-        emit EmergencyWithdrawToken(token, to, balance);
+        IERC20(token).safeTransfer(to, amount);
     }
 
+    function rescueETH(address payable to, uint256 amount) external onlyOwner {
+        Address.sendValue(to, amount);
+    }
+
+    /// @notice Add or remove a target from the whitelist
+    /// @param target The address to whitelist/unwhitelist
+    /// @param status True to whitelist, false to remove
     function setWhitelistedTarget(
         address target,
         bool status
     ) external onlyOwner {
-        require(target != address(0), "INVALID_TARGET");
         whitelistedTargets[target] = status;
         emit TargetWhitelisted(target, status);
     }
 
+    /// @notice Batch whitelist multiple targets
+    /// @param targets Array of addresses to whitelist
     function batchWhitelistTargets(
         address[] calldata targets
     ) external onlyOwner {
-        require(targets.length <= MAX_BATCH_WHITELIST, "TOO_MANY_TARGETS");
-        for (uint256 i = 0; i < targets.length; i++) {
-            require(targets[i] != address(0), "INVALID_TARGET");
+        for (uint256 i; i < targets.length; ) {
             whitelistedTargets[targets[i]] = true;
             emit TargetWhitelisted(targets[i], true);
+            unchecked {
+                ++i;
+            }
         }
     }
 
-    /// @notice Add or update a whitelisted selector for injection
-    /// @param selector The function selector (first 4 bytes of calldata)
-    /// @param offset The expected amountIn offset. Use 0 to remove from whitelist.
-    function setSelectorOffset(
-        bytes4 selector,
-        uint256 offset
-    ) external onlyOwner {
-        if (offset != 0) {
-            // Validate offset is reasonable: 4 bytes selector + N*32 bytes params
-            if (offset < 4) revert InvalidOffset(offset);
-        }
-        selectorOffsets[selector] = offset;
-        emit SelectorWhitelisted(selector, offset);
-    }
-
-    /// @notice Executes a sequence of arbitrary calls after pulling ERC-20 funds from caller.
-    /// @param pulls Tokens and amounts to transfer from caller into executor.
-    /// @param approvals ERC-20 approvals to set. Revoked after execution if revokeAfter=true.
-    /// @param calls Arbitrary calls (DEX swaps, etc.).
-    /// @param tokensToFlush Token addresses to sweep to caller after execution.
-    /// @return results Raw return data for each call.
-    /// @dev SECURITY: Recipient is always msg.sender. tokensToFlush lets user specify output tokens.
     function execute(
         TokenPull[] calldata pulls,
         Approval[] calldata approvals,
         Call[] calldata calls,
         address[] calldata tokensToFlush
-    ) external payable nonReentrant returns (bytes[] memory results) {
-        // SECURITY: Array length limits
-        if (pulls.length > MAX_PULLS)
-            revert ArrayLengthExceeded("pulls", pulls.length, MAX_PULLS);
-        if (approvals.length > MAX_APPROVALS)
-            revert ArrayLengthExceeded(
-                "approvals",
-                approvals.length,
-                MAX_APPROVALS
-            );
-        if (calls.length > MAX_CALLS)
-            revert ArrayLengthExceeded("calls", calls.length, MAX_CALLS);
-        if (tokensToFlush.length > MAX_FLUSH_TOKENS)
-            revert ArrayLengthExceeded(
-                "tokensToFlush",
-                tokensToFlush.length,
-                MAX_FLUSH_TOKENS
-            );
+    )
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+        returns (bytes[] memory results)
+    {
+        uint256 ethBalanceBefore = address(this).balance - msg.value;
+        uint256[] memory tokenBalancesBefore = _snapshotBalances(tokensToFlush);
 
-        // SECURITY: Safe ETH tracking - avoid underflow
-        uint256 preExistingEth;
-        {
-            uint256 ethBefore = address(this).balance;
-            preExistingEth = ethBefore > msg.value ? ethBefore - msg.value : 0;
-        }
-
-        // SECURITY: Track pre-existing token balances to prevent dust sweeping
-        uint256[] memory preExistingTokenBalances = new uint256[](
-            tokensToFlush.length
-        );
-        for (uint256 i = 0; i < tokensToFlush.length; i++) {
-            address token = tokensToFlush[i];
-            if (token == address(0)) continue;
-
-            // SECURITY: Check for duplicate tokens in flush list
-            for (uint256 j = 0; j < i; j++) {
-                if (tokensToFlush[j] == token) {
-                    revert DuplicateTokenInFlush(token);
-                }
-            }
-
-            preExistingTokenBalances[i] = IERC20Minimal(token).balanceOf(
-                address(this)
-            );
-        }
-
-        // SECURITY: Track pulled amounts per token (summed for duplicates)
-        (
-            address[] memory pulledTokens,
-            uint256[] memory pulledAmounts
-        ) = _buildPulledTracker(pulls);
-
-        _pullTokensFromSender(pulls);
-        _validateAndSetApprovals(approvals);
-        results = _performCalls(calls, pulledTokens, pulledAmounts);
+        _pullTokens(pulls);
+        _setApprovals(approvals);
+        results = _performCalls(calls);
         _revokeApprovals(approvals);
-
-        // SECURITY: Flush only delta (current - pre-existing) for both tokens and ETH
-        uint256 ethReturned = _flushBalances(
+        _flushDeltas(
             msg.sender,
             tokensToFlush,
-            preExistingTokenBalances,
-            preExistingEth
+            tokenBalancesBefore,
+            ethBalanceBefore
         );
-
-        emit Executed(msg.sender, pulls.length, calls.length, ethReturned);
     }
 
-    /// @dev Builds tracking arrays, summing duplicate tokens
-    function _buildPulledTracker(
-        TokenPull[] calldata pulls
-    ) private pure returns (address[] memory tokens, uint256[] memory amounts) {
-        // First pass: identify unique tokens
-        uint256 uniqueCount = 0;
-        address[] memory tempTokens = new address[](pulls.length);
-        uint256[] memory tempAmounts = new uint256[](pulls.length);
-
-        for (uint256 i = 0; i < pulls.length; i++) {
-            address token = pulls[i].token;
-            uint256 amount = pulls[i].amount;
-
-            // Check if token already in list
-            bool found = false;
-            for (uint256 j = 0; j < uniqueCount; j++) {
-                if (tempTokens[j] == token) {
-                    tempAmounts[j] += amount; // Sum duplicates
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
-                tempTokens[uniqueCount] = token;
-                tempAmounts[uniqueCount] = amount;
-                uniqueCount++;
-            }
-        }
-
-        // Create correctly sized arrays
-        tokens = new address[](uniqueCount);
-        amounts = new uint256[](uniqueCount);
-        for (uint256 i = 0; i < uniqueCount; i++) {
-            tokens[i] = tempTokens[i];
-            amounts[i] = tempAmounts[i];
-        }
-    }
-
-    function _pullTokensFromSender(TokenPull[] calldata pulls) private {
-        for (uint256 index = 0; index < pulls.length; index++) {
-            TokenPull calldata entry = pulls[index];
-            if (entry.amount == 0) continue;
-
-            (bool success, bytes memory returnData) = entry.token.call(
-                abi.encodeWithSelector(
-                    IERC20Minimal.transferFrom.selector,
-                    msg.sender,
-                    address(this),
-                    entry.amount
-                )
-            );
-            if (!success) {
-                revert TokenPullFailed(entry.token, entry.amount);
-            }
-            if (returnData.length > 0 && !abi.decode(returnData, (bool))) {
-                revert TokenPullFailed(entry.token, entry.amount);
+    function _snapshotBalances(
+        address[] calldata tokens
+    ) private view returns (uint256[] memory balances) {
+        balances = new uint256[](tokens.length);
+        for (uint256 i; i < tokens.length; ) {
+            balances[i] = IERC20(tokens[i]).balanceOf(address(this));
+            unchecked {
+                ++i;
             }
         }
     }
 
-    function _validateAndSetApprovals(Approval[] calldata approvals) private {
-        for (uint256 index = 0; index < approvals.length; index++) {
-            Approval calldata entry = approvals[index];
-            if (entry.amount == 0) continue;
-
-            // SECURITY: Spender must be whitelisted
-            if (!whitelistedTargets[entry.spender]) {
-                revert SpenderNotWhitelisted(entry.spender);
-            }
-
-            // SECURITY: Reset to 0 first (USDT compatibility)
-            _callToken(
-                entry.token,
-                abi.encodeWithSelector(
-                    IERC20Minimal.approve.selector,
-                    entry.spender,
-                    0
-                )
+    function _pullTokens(TokenPull[] calldata pulls) private {
+        for (uint256 i; i < pulls.length; ) {
+            TokenPull calldata p = pulls[i];
+            IERC20(p.token).safeTransferFrom(
+                msg.sender,
+                address(this),
+                p.amount
             );
-
-            (bool success, bytes memory returnData) = entry.token.call(
-                abi.encodeWithSelector(
-                    IERC20Minimal.approve.selector,
-                    entry.spender,
-                    entry.amount
-                )
-            );
-            if (!success) {
-                revert TokenApprovalFailed(
-                    entry.token,
-                    entry.spender,
-                    entry.amount
-                );
+            unchecked {
+                ++i;
             }
-            if (returnData.length > 0 && !abi.decode(returnData, (bool))) {
-                revert TokenApprovalFailed(
-                    entry.token,
-                    entry.spender,
-                    entry.amount
-                );
+        }
+    }
+
+    function _setApprovals(Approval[] calldata approvals) private {
+        for (uint256 i; i < approvals.length; ) {
+            Approval calldata a = approvals[i];
+            IERC20(a.token).forceApprove(a.spender, a.amount);
+            unchecked {
+                ++i;
             }
         }
     }
 
     function _performCalls(
-        Call[] calldata calls,
-        address[] memory pulledTokens,
-        uint256[] memory pulledAmounts
+        Call[] calldata calls
     ) private returns (bytes[] memory results) {
         results = new bytes[](calls.length);
+        for (uint256 i; i < calls.length; ) {
+            Call calldata c = calls[i];
 
-        for (uint256 index = 0; index < calls.length; index++) {
-            Call calldata entry = calls[index];
+            // Security: Only allow calls to whitelisted targets
+            if (!whitelistedTargets[c.target])
+                revert TargetNotWhitelisted(c.target);
 
-            // SECURITY: Target must be whitelisted
-            if (!whitelistedTargets[entry.target]) {
-                revert TargetNotWhitelisted(entry.target);
-            }
+            bytes memory data = c.data;
 
-            bytes memory data = entry.data;
-            if (entry.injectToken != address(0)) {
-                // SECURITY: Extract selector from calldata
-                if (data.length < 4) {
-                    revert InvalidInjectionOffset(
-                        entry.injectOffset,
-                        data.length
-                    );
-                }
-                bytes4 selector;
-                assembly {
-                    // CRITICAL FIX: bytes4 reads from high bytes, so DON'T shift!
-                    // mload returns selector already in high bytes: 0x414bf389...00
-                    // shr(224) was WRONG - it moved selector to low bytes: 0x00...414bf389
-                    // but bytes4 still reads high bytes, giving 0x00000000
-                    selector := mload(add(data, 32))
-                }
-
-                // SECURITY: Validate offset matches known selector
-                uint256 expectedOffset = _getExpectedOffset(selector);
-                if (expectedOffset == 0) {
-                    revert InvalidSelectorForInjection(selector);
-                }
-                if (entry.injectOffset != expectedOffset) {
-                    revert OffsetMismatchForSelector(
-                        selector,
-                        entry.injectOffset,
-                        expectedOffset
-                    );
-                }
-
-                // SECURITY: Cap injection to pulled amount only
-                // FIX: For multi-hop swaps, intermediate tokens (swap outputs) aren't in pulledTokens
-                // If token wasn't pulled, it must be from a previous swap output - use full balance
-                uint256 maxInjectAmount = _getPulledAmount(
-                    entry.injectToken,
-                    pulledTokens,
-                    pulledAmounts
+            if (c.injectToken != address(0)) {
+                uint256 injectedAmount = IERC20(c.injectToken).balanceOf(
+                    address(this)
                 );
+                if (injectedAmount == 0) revert ZeroAmountInjection();
 
-                // Allow full balance for intermediate tokens (not pulled, but output from previous hop)
-                if (maxInjectAmount == 0) {
-                    maxInjectAmount = type(uint256).max;
-                }
+                if (c.injectOffset + 32 > data.length)
+                    revert InvalidInjectionOffset(c.injectOffset, data.length);
 
-                uint256 tokenBalance = IERC20Minimal(entry.injectToken)
-                    .balanceOf(address(this));
-                uint256 amountToInject = tokenBalance > maxInjectAmount
-                    ? maxInjectAmount
-                    : tokenBalance;
-
-                if (amountToInject == 0) revert ZeroAmountNotAllowed();
-
-                if (entry.injectOffset + 32 > data.length) {
-                    revert InvalidInjectionOffset(
-                        entry.injectOffset,
-                        data.length
-                    );
-                }
-
-                uint256 offset = entry.injectOffset;
+                uint256 offset = c.injectOffset;
                 assembly {
-                    mstore(add(add(data, 32), offset), amountToInject)
+                    mstore(add(add(data, 32), offset), injectedAmount)
                 }
             }
 
-            (bool success, bytes memory returnData) = entry.target.call{
-                value: entry.value
-            }(data);
+            (bool success, bytes memory ret) = c.target.call{value: c.value}(
+                data
+            );
+
             if (!success) {
-                assembly {
-                    let ptr := add(returnData, 0x20)
-                    let size := mload(returnData)
-                    revert(ptr, size)
+                if (ret.length > 0) {
+                    assembly {
+                        let returndata_size := mload(ret)
+                        revert(add(32, ret), returndata_size)
+                    }
+                } else {
+                    revert ExecutionFailed(i, c.target, "");
                 }
             }
-            results[index] = returnData;
-        }
-    }
-
-    /// @dev Returns SUM of amounts for a token (handles duplicates)
-    function _getPulledAmount(
-        address token,
-        address[] memory pulledTokens,
-        uint256[] memory pulledAmounts
-    ) private pure returns (uint256) {
-        for (uint256 i = 0; i < pulledTokens.length; i++) {
-            if (pulledTokens[i] == token) {
-                return pulledAmounts[i]; // Already summed in _buildPulledTracker
+            results[i] = ret;
+            unchecked {
+                ++i;
             }
         }
-        return 0;
-    }
-
-    /// @dev Returns expected injection offset from storage mapping
-    /// @param selector The function selector to look up
-    /// @return offset Expected offset, or 0 if selector is not whitelisted
-    function _getExpectedOffset(
-        bytes4 selector
-    ) private view returns (uint256) {
-        return selectorOffsets[selector];
     }
 
     function _revokeApprovals(Approval[] calldata approvals) private {
-        for (uint256 index = 0; index < approvals.length; index++) {
-            Approval calldata entry = approvals[index];
-            if (!entry.revokeAfter || entry.amount == 0) continue;
-
-            _callToken(
-                entry.token,
-                abi.encodeWithSelector(
-                    IERC20Minimal.approve.selector,
-                    entry.spender,
-                    0
-                )
-            );
+        for (uint256 i; i < approvals.length; ) {
+            Approval calldata a = approvals[i];
+            // Security: ALWAYS revoke approvals to prevent hijacking
+            IERC20(a.token).forceApprove(a.spender, 0);
+            unchecked {
+                ++i;
+            }
         }
     }
 
-    function _flushBalances(
+    function _flushDeltas(
         address recipient,
-        address[] calldata tokensToFlush,
-        uint256[] memory preExistingTokenBalances,
-        uint256 preExistingEth
-    ) private returns (uint256 ethReturned) {
-        require(recipient != address(0), "INVALID_RECIPIENT");
-
-        // SECURITY: Flush only token DELTA (current - pre-existing)
-        for (uint256 index = 0; index < tokensToFlush.length; index++) {
-            address token = tokensToFlush[index];
-            if (token == address(0)) continue;
-
-            uint256 currentBalance = IERC20Minimal(token).balanceOf(
-                address(this)
-            );
-            uint256 preExisting = preExistingTokenBalances[index];
-
-            // Only flush the delta (what was added during this execution)
-            if (currentBalance > preExisting) {
-                uint256 deltaToFlush = currentBalance - preExisting;
-                _callToken(
-                    token,
-                    abi.encodeWithSelector(
-                        IERC20Minimal.transfer.selector,
-                        recipient,
-                        deltaToFlush
-                    )
-                );
+        address[] calldata tokens,
+        uint256[] memory balancesBefore,
+        uint256 ethBalanceBefore
+    ) private {
+        for (uint256 i; i < tokens.length; ) {
+            uint256 balanceAfter = IERC20(tokens[i]).balanceOf(address(this));
+            // Token Dust Protection: Only flush the delta (difference)
+            // This prevents dust attacks where attacker sends small amounts before tx
+            if (balanceAfter > balancesBefore[i]) {
+                uint256 delta = balanceAfter - balancesBefore[i];
+                // Only transfer if delta is meaningful (> 0)
+                if (delta > 0) {
+                    IERC20(tokens[i]).safeTransfer(recipient, delta);
+                }
+            }
+            unchecked {
+                ++i;
             }
         }
 
-        // SECURITY: Only return ETH delta (excluding pre-existing dust)
-        uint256 currentEthBalance = address(this).balance;
-        if (currentEthBalance > preExistingEth) {
-            ethReturned = currentEthBalance - preExistingEth;
-            (bool success, ) = recipient.call{value: ethReturned}("");
-            if (!success) revert NativeTransferFailed(recipient, ethReturned);
-        }
-    }
-
-    function _callToken(address token, bytes memory data) private {
-        (bool success, bytes memory returnData) = token.call(data);
-        if (!success) {
-            revert TokenFlushFailed(token);
-        }
-        if (returnData.length > 0 && !abi.decode(returnData, (bool))) {
-            revert TokenFlushFailed(token);
+        // ETH Dust Protection: Same principle
+        uint256 ethBalanceAfter = address(this).balance;
+        if (ethBalanceAfter > ethBalanceBefore) {
+            uint256 ethDelta = ethBalanceAfter - ethBalanceBefore;
+            if (ethDelta > 0) {
+                Address.sendValue(payable(recipient), ethDelta);
+            }
         }
     }
 }
